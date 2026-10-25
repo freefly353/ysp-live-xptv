@@ -1,6 +1,6 @@
 /*
  * ===================================================================
- *  央视频直播 (YSP Live v9.5) —— XPTV 内置 JS 扩展版 v2.2.1
+ *  央视频直播 (YSP Live v9.5) —— XPTV 内置 JS 扩展版 v2.2.2
  * ===================================================================
  *
  *  v2.1.0 是在 v2.0.0 基础上加的自动换源（见下）；v2 是对 v1.0.0 的修正重发，不是重写：Device / BK / 频道表与
@@ -45,6 +45,10 @@
  *     POST 让宿主 $fetch 一直不回包，阻塞了 BK 回退。现给 JCE 请求加 6 秒超时，
  *     超时或失败时改用 latin-1 字符串体重试一次；都没有定时器的宿主只用
  *     字符串体（快速失败，不挂起）。JCE 再也不会无限挂起，失败即退回 BK。
+ *  8. v2.2.2：卫视仍转圈，央视正常。两手准备：① 频道备注里临时加上版本号
+ *     （v2.2.2），用来确认 XPTV 实际加载的是哪个版本（缓存旧版是常见原因）；
+ *     ② 给所有 $fetch 请求（BK/Device 上游）也加 10 秒超时，防止上游不回包
+ *     时整个解析挂起。确认版本后会去掉备注里的版本号。
  *
  *  路由（与 v1.0.0 相同）：
  *  - auto：有 Device ID 且不在 forceBK 的台优先 Device，失败回退 BK；
@@ -711,9 +715,17 @@ var YSPCore = (function () {
         let res;
         if (typeof $fetch !== "undefined") {
             if (method === "POST" && typeof $fetch.post === "function") {
-                res = await $fetch.post(req.url, req.body || "", { headers: reqHeaders });
+                res = await withTimeout(
+                    $fetch.post(req.url, req.body || "", { headers: reqHeaders }),
+                    10000,
+                    "HTTP request timeout"
+                );
             } else if (typeof $fetch.get === "function") {
-                res = await $fetch.get(req.url, { headers: reqHeaders });
+                res = await withTimeout(
+                    $fetch.get(req.url, { headers: reqHeaders }),
+                    10000,
+                    "HTTP request timeout"
+                );
             } else {
                 throw new Error("$fetch method unavailable");
             }
@@ -3347,7 +3359,7 @@ function createJCEProtocol(h) {
             vod_id: c.id,
             vod_name: c.name,
             vod_pic: c.logo || "",
-            vod_remarks: hasDevice ? c.quality + " · 投屏源" : c.quality,
+            vod_remarks: (hasDevice ? c.quality + " · 投屏源" : c.quality) + " · v2.2.2",
             ext: {
                 id: c.id,
                 name: c.name,
@@ -3377,7 +3389,7 @@ function createJCEProtocol(h) {
 
 var appConfig = {
     ver: 2,
-    version: "2.2.1",
+    version: "2.2.2",
     name: "央视频直播",
     title: "央视频直播",
     desc: "央视频电视直播 (Device投屏超清 + BK主备源 v2)",
