@@ -1,10 +1,10 @@
-# YSP Live for XPTV — 央视频直播 v2.1.0
+# YSP Live for XPTV — 央视频直播 v2.1.1
 
 央视频（Yangshipin）直播，XPTV / TVBox `csp` 格式的 JS 扩展。64 个频道（央视 30 + 卫视 34），点播时现算签名地址播放。
 
 ## 文件
 
-- `ysp-live-xptv.js` — 扩展本体（2,907 行）。以用户提供的 Ysp_Xptv_1.0.0.txt 为底，在 v2.0.0 修正版上加了 v2.1.0 的自动换源。
+- `ysp-live-xptv.js` — 扩展本体（2,907 行）。以用户提供的 Ysp_Xptv_1.0.0.txt 为底，在 v2.0.0 修正版上加了 v2.1.0 的自动换源与 v2.1.1 的重新解析。
 - `subscription.json` — 单站点订阅（type 3 / api `csp_ysp` / ext 为本文件 raw 链接），可直接当 XPTV 订阅地址。
 
 ## 怎么用
@@ -33,6 +33,8 @@ https://raw.githubusercontent.com/freefly353/ysp-live-xptv/main/subscription.jso
 卫视“有时能播有时不能播”的原因是 BK 首选地址当时不可用（解析成功但播放 403），而旧版只在解析抛错时才回退，解析成功但地址坏了就直接返回坏地址。v2.1.0 在点播前实测播放地址：用播放请求头拉一次 m3u8，看正文是不是真正的播放列表（`#EXTM3U`）；首选地址不可用时自动换备线，Device 地址不可用时自动退回 BK；BK 解析失败重试一次。校验是 fail-open 的：校验请求本身失败（网络问题）时仍返回原地址，让播放器再试。
 
 频道表与 BK 签名已与 JSTV 版（[ysp-live-spider](https://github.com/freefly353/ysp-live-spider)）逐项核对：64 个台的 id / channelID / livePID / definition 零差异，BK 的 PLATFORM / APP_VERSION / TEA_KEY / 请求参数 / 候选地址排序也一致。
+
+v2.1.1 补充：BK 候选地址全部不可用时，重新向上游要一份新地址（新签名）再试一次。JSTV 里清后台重开能修好，是因为它清掉了内存里的旧状态；XPTV 里清后台重开修不好，说明坏的是上游当时给的地址，不是本地状态——所以改为重新解析一次，而不是只换备线。
 
 ## 验证状态
 

@@ -30,6 +30,10 @@
  *     Device 地址不可用时自动退回 BK；BK 解析失败重试一次。卫视“有时能播
  *     有时不能播”多半是首选地址当时不可用，v2.1.0 会自动换到可用的那条，
  *     不用手动切线路。
+ *  5. v2.1.1：BK 候选地址全部不可用时，重新向上游要一份新地址（新签名）再试
+ *     一次。JSTV 里清后台重开能修好，是因为它清掉了内存里的旧状态；XPTV 里
+ *     清后台重开修不好，说明坏的是上游当时给的地址，不是本地状态——所以
+ *     v2.1.1 改为重新解析一次，而不是只换备线。
  *
  *  路由（与 v1.0.0 相同）：
  *  - auto：有 Device ID 且不在 forceBK 的台优先 Device，失败回退 BK；
@@ -2599,7 +2603,29 @@ var YSPCore = (function () {
     async function pickWorkingBK(channel) {
         const r = await resolveBKWithRetry(channel);
         const candidates = Array.isArray(r.candidates) && r.candidates.length ? r.candidates : [r.url];
-        const pick = await pickWorkingCandidate(candidates, r.headers);
+        let pick = await pickWorkingCandidate(candidates, r.headers);
+        // 候选地址全部不可用时，重新向上游要一份新地址（新签名）再试一次。
+        // XPTV 里清后台重开修不好这类失败，说明坏的是上游当时给的地址，
+        // 不是本地状态，所以直接重新解析比只换备线更有效。
+        if (pick && pick.verdict === "bad") {
+            safeLog("BK 候选地址全部不可用，重新解析一次 (" + channel.id + ")");
+            try {
+                const r2 = await resolveBKWithRetry(channel);
+                const candidates2 =
+                    Array.isArray(r2.candidates) && r2.candidates.length ? r2.candidates : [r2.url];
+                const pick2 = await pickWorkingCandidate(candidates2, r2.headers);
+                if (pick2 && pick2.verdict !== "bad") {
+                    const ordered = [pick2.url].concat(
+                        candidates2.filter(function (u) {
+                            return u !== pick2.url;
+                        })
+                    );
+                    return Object.assign({}, r2, { url: pick2.url, candidates: ordered });
+                }
+            } catch (e) {
+                safeLog("BK 重新解析失败，返回原结果 (" + channel.id + "): " + (e.message || e));
+            }
+        }
         if (pick && pick.index > 0) {
             const ordered = [pick.url].concat(
                 candidates.filter(function (u) {
@@ -2707,7 +2733,7 @@ var YSPCore = (function () {
 
 var appConfig = {
     ver: 2,
-    version: "2.1.0",
+    version: "2.1.1",
     name: "央视频直播",
     title: "央视频直播",
     desc: "央视频电视直播 (Device投屏超清 + BK主备源 v2)",
