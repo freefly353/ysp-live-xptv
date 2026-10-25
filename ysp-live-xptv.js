@@ -1,6 +1,6 @@
 /*
  * ===================================================================
- *  央视频直播 (YSP Live v9.5) —— XPTV 内置 JS 扩展版 v2.0.0
+ *  央视频直播 (YSP Live v9.5) —— XPTV 内置 JS 扩展版 v2.2.0
  * ===================================================================
  *
  *  v2.1.0 是在 v2.0.0 基础上加的自动换源（见下）；v2 是对 v1.0.0 的修正重发，不是重写：Device / BK / 频道表与
@@ -34,6 +34,13 @@
  *     一次。JSTV 里清后台重开能修好，是因为它清掉了内存里的旧状态；XPTV 里
  *     清后台重开修不好，说明坏的是上游当时给的地址，不是本地状态——所以
  *     v2.1.1 改为重新解析一次，而不是只换备线。
+ *  6. v2.2.0：把 JCE 也搬进来了（纯 JS 实现）。卫视与 JSTV 的根本区别就是
+ *     JCE：JSTV 卫视先走 JCE、再退 BK，XPTV 之前只有 BK。JCE 的二进制编解码
+ *     与 JSTV 版逐字相同；请求压缩用纯 JS stored-gzip，回包解压用纯 JS
+ *     inflate（已用 Node zlib 往返验证 47/47）。auto 对有回看的台先试 JCE，
+ *     失败冷却 5 分钟并退回 BK；也可手动选 [JCE] 线路。注意：JCE 请求体是
+ *     二进制（Uint8Array），回包格式也依赖宿主 $fetch 的处理，真机验证前
+ *     不能保证 $fetch 一定按二进制透传——若 JCE 在真机上失败，会自动退回 BK。
  *
  *  路由（与 v1.0.0 相同）：
  *  - auto：有 Device ID 且不在 forceBK 的台优先 Device，失败回退 BK；
@@ -765,6 +772,25 @@ var YSPCore = (function () {
         },
         http: {
             request: xptvHttpRequest,
+            // 二进制 POST（JCE 用）：body 可为 Uint8Array；返回的 data 原样透传
+            // （Uint8Array / ArrayBuffer / 字符串，调用方自行转字节）。
+            requestBinary: async function (req) {
+                if (typeof $fetch !== "undefined" && typeof $fetch.post === "function") {
+                    const res = await $fetch.post(req.url, req.body, { headers: req.headers || {} });
+                    const status =
+                        typeof res.status === "number"
+                            ? res.status
+                            : res.data !== undefined || res.body !== undefined
+                              ? 200
+                              : 502;
+                    return {
+                        ok: status >= 200 && status < 300,
+                        status: status,
+                        data: res.data !== undefined ? res.data : res.body,
+                    };
+                }
+                throw new Error("当前运行环境未提供 $fetch.post");
+            },
         },
     };
 
@@ -1743,6 +1769,522 @@ var YSPCore = (function () {
     // 五、频道表模块 (createChannelTable) —— 64 个央视 & 卫视频道与路由策略
     // =========================================================================
 
+    // =========================================================================
+    // 四（续）、纯 JS gzip / inflate（GzipPure）—— 供 JCE 请求压缩与回包解压
+    // =========================================================================
+
+// Pure-JS gzip (stored compress) + gunzip/inflate (decompress) + CRC32.
+// No Node.js, no Buffer — only Uint8Array / plain arrays. Written for XPTV's
+// JavaScriptCore, tested against Node's zlib (see test-gzip-pure.cjs).
+var GzipPure = (function () {
+    "use strict";
+
+    // ---- CRC-32 (IEEE, poly 0xEDB88320) ----
+    var CRC_TABLE = (function () {
+        var t = new Array(256);
+        for (var n = 0; n < 256; n++) {
+            var c = n;
+            for (var k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+            t[n] = c >>> 0;
+        }
+        return t;
+    })();
+    function crc32(bytes) {
+        var c = 0xffffffff;
+        for (var i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 255] ^ (c >>> 8);
+        return (c ^ 0xffffffff) >>> 0;
+    }
+
+    // ---- gzip compress with STORED (uncompressed) DEFLATE blocks ----
+    // Valid gzip; any gunzip accepts it. Used for the JCE request packet.
+    function gzipCompressStored(data) {
+        var out = [31, 139, 8, 0, 0, 0, 0, 0, 0, 3];
+        var pos = 0;
+        if (data.length === 0) {
+            out.push(1, 0, 0, 255, 255); // final empty stored block
+        } else {
+            while (pos < data.length) {
+                var chunk = Math.min(65535, data.length - pos);
+                var last = pos + chunk >= data.length ? 1 : 0;
+                out.push(last); // BFINAL + BTYPE=00 (byte-aligned: low 3 bits)
+                out.push(chunk & 255, (chunk >>> 8) & 255);
+                var nlen = (~chunk) & 65535;
+                out.push(nlen & 255, (nlen >>> 8) & 255);
+                for (var i = 0; i < chunk; i++) out.push(data[pos + i]);
+                pos += chunk;
+            }
+        }
+        var crc = crc32(data);
+        out.push(crc & 255, (crc >>> 8) & 255, (crc >>> 16) & 255, (crc >>> 24) & 255);
+        var size = data.length >>> 0;
+        out.push(size & 255, (size >>> 8) & 255, (size >>> 16) & 255, (size >>> 24) & 255);
+        return out;
+    }
+
+    // ---- bit reader (LSB-first, per RFC 1951) ----
+    function BitReader(bytes, start) {
+        this.b = bytes;
+        this.p = start || 0; // byte position
+        this.bit = 0; // bit position within current byte (0 = LSB)
+    }
+    BitReader.prototype.read = function (n) {
+        var v = 0;
+        for (var i = 0; i < n; i++) {
+            if (this.p >= this.b.length) throw new Error("inflate: unexpected end of input");
+            v |= ((this.b[this.p] >>> this.bit) & 1) << i;
+            this.bit++;
+            if (this.bit === 8) { this.bit = 0; this.p++; }
+        }
+        return v;
+    };
+    BitReader.prototype.alignByte = function () {
+        if (this.bit !== 0) { this.bit = 0; this.p++; }
+    };
+
+    // ---- canonical Huffman decoder ----
+    // lengths: array of code lengths per symbol. Builds canonical codes and
+    // decodes by accumulating bits (correct; JCE payloads are small).
+    function Huffman(lengths) {
+        this.lengths = lengths;
+        this.maxLen = 0;
+        for (var i = 0; i < lengths.length; i++) if (lengths[i] > this.maxLen) this.maxLen = lengths[i];
+        // count codes per length, then assign canonical codes
+        var blCount = new Array(this.maxLen + 1).fill(0);
+        for (var j = 0; j < lengths.length; j++) if (lengths[j] > 0) blCount[lengths[j]]++;
+        var code = 0;
+        var nextCode = new Array(this.maxLen + 1).fill(0);
+        for (var bits = 1; bits <= this.maxLen; bits++) {
+            code = (code + blCount[bits - 1]) << 1;
+            nextCode[bits] = code;
+        }
+        // map: (length, code) -> symbol, stored as map[length][code]
+        this.map = [];
+        for (var l = 0; l <= this.maxLen; l++) this.map[l] = {};
+        for (var s = 0; s < lengths.length; s++) {
+            var len = lengths[s];
+            if (len > 0) { this.map[len][nextCode[len]] = s; nextCode[len]++; }
+        }
+    }
+    Huffman.prototype.decode = function (br) {
+        var code = 0;
+        for (var len = 1; len <= this.maxLen; len++) {
+            code = (code << 1) | br.read(1);
+            var sym = this.map[len][code];
+            if (sym !== undefined) return sym;
+        }
+        throw new Error("inflate: invalid Huffman code");
+    };
+
+    // DEFLATE length / distance base values and extra bits (RFC 1951 §3.2.5)
+    var LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+    var LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+    var DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+    var DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+    var CLEN_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+    function inflateBlock(br, litHuff, distHuff, out) {
+        for (;;) {
+            var sym = litHuff.decode(br);
+            if (sym < 256) {
+                out.push(sym);
+            } else if (sym === 256) {
+                return;
+            } else {
+                var li = sym - 257;
+                if (li < 0 || li >= LEN_BASE.length) throw new Error("inflate: bad length symbol " + sym);
+                var len = LEN_BASE[li] + br.read(LEN_EXTRA[li]);
+                var dsym = distHuff.decode(br);
+                if (dsym < 0 || dsym >= DIST_BASE.length) throw new Error("inflate: bad distance symbol " + dsym);
+                var dist = DIST_BASE[dsym] + br.read(DIST_EXTRA[dsym]);
+                if (dist > out.length) throw new Error("inflate: distance too far back");
+                var from = out.length - dist;
+                for (var i = 0; i < len; i++) out.push(out[from + i]);
+            }
+        }
+    }
+
+    // Raw DEFLATE stream decompression. bytes: input array, start: byte offset.
+    // Returns { data: number[], nextByte: index just past the stream }.
+    function inflateRaw(bytes, start) {
+        var br = new BitReader(bytes, start || 0);
+        var out = [];
+        for (;;) {
+            var bfinal = br.read(1);
+            var btype = br.read(2);
+            if (btype === 0) {
+                br.alignByte();
+                if (br.p + 4 > bytes.length) throw new Error("inflate: truncated stored block");
+                var len = bytes[br.p] | (bytes[br.p + 1] << 8);
+                var nlen = bytes[br.p + 2] | (bytes[br.p + 3] << 8);
+                if (len !== ((~nlen) & 65535)) throw new Error("inflate: stored LEN/NLEN mismatch");
+                br.p += 4;
+                if (br.p + len > bytes.length) throw new Error("inflate: truncated stored data");
+                for (var i = 0; i < len; i++) out.push(bytes[br.p + i]);
+                br.p += len;
+            } else if (btype === 1) {
+                var litLen = new Array(288).fill(0);
+                for (var a = 0; a < 144; a++) litLen[a] = 8;
+                for (var b = 144; b < 256; b++) litLen[b] = 9;
+                for (var c = 256; c < 280; c++) litLen[c] = 7;
+                for (var d = 280; d < 288; d++) litLen[d] = 8;
+                var distLen = new Array(32).fill(5);
+                inflateBlock(br, new Huffman(litLen), new Huffman(distLen), out);
+            } else if (btype === 2) {
+                var hlit = br.read(5) + 257;
+                var hdist = br.read(5) + 1;
+                var hclen = br.read(4) + 4;
+                var clen = new Array(19).fill(0);
+                for (var e = 0; e < hclen; e++) clen[CLEN_ORDER[e]] = br.read(3);
+                var clHuff = new Huffman(clen);
+                var total = hlit + hdist;
+                var lengths = new Array(total).fill(0);
+                var i2 = 0;
+                while (i2 < total) {
+                    var s2 = clHuff.decode(br);
+                    if (s2 <= 15) {
+                        lengths[i2++] = s2;
+                    } else if (s2 === 16) {
+                        if (i2 === 0) throw new Error("inflate: repeat with no previous length");
+                        var prev = lengths[i2 - 1];
+                        var rep = 3 + br.read(2);
+                        for (var r = 0; r < rep; r++) lengths[i2++] = prev;
+                    } else if (s2 === 17) {
+                        var rep17 = 3 + br.read(3);
+                        for (var r2 = 0; r2 < rep17; r2++) lengths[i2++] = 0;
+                    } else if (s2 === 18) {
+                        var rep18 = 11 + br.read(7);
+                        for (var r3 = 0; r3 < rep18; r3++) lengths[i2++] = 0;
+                    } else {
+                        throw new Error("inflate: bad code-length symbol " + s2);
+                    }
+                }
+                var litHuff = new Huffman(lengths.slice(0, hlit));
+                var distHuff = new Huffman(lengths.slice(hlit));
+                inflateBlock(br, litHuff, distHuff, out);
+            } else {
+                throw new Error("inflate: invalid block type " + btype);
+            }
+            if (bfinal) break;
+        }
+        if (br.bit !== 0) br.p++;
+        return { data: out, nextByte: br.p };
+    }
+
+    // ---- gunzip (RFC 1952) ----
+    function gunzip(bytes) {
+        if (!bytes || bytes.length < 18) throw new Error("gunzip: input too short");
+        if (bytes[0] !== 31 || bytes[1] !== 139) throw new Error("gunzip: bad magic");
+        if (bytes[2] !== 8) throw new Error("gunzip: not DEFLATE");
+        var flg = bytes[3];
+        var p = 10;
+        if (flg & 4) { // FEXTRA
+            if (p + 2 > bytes.length) throw new Error("gunzip: truncated FEXTRA");
+            var xlen = bytes[p] | (bytes[p + 1] << 8);
+            p += 2 + xlen;
+        }
+        if (flg & 8) { while (p < bytes.length && bytes[p] !== 0) p++; p++; } // FNAME
+        if (flg & 16) { while (p < bytes.length && bytes[p] !== 0) p++; p++; } // FCOMMENT
+        if (flg & 2) p += 2; // FHCRC
+        if (p > bytes.length) throw new Error("gunzip: truncated header");
+        var res = inflateRaw(bytes, p);
+        var end = res.nextByte;
+        if (end + 8 > bytes.length) throw new Error("gunzip: truncated footer");
+        var crc = (bytes[end] | (bytes[end + 1] << 8) | (bytes[end + 2] << 16) | (bytes[end + 3] << 24)) >>> 0;
+        var isize = (bytes[end + 4] | (bytes[end + 5] << 8) | (bytes[end + 6] << 16) | (bytes[end + 7] << 24)) >>> 0;
+        if ((res.data.length >>> 0) !== isize) throw new Error("gunzip: ISIZE mismatch");
+        if (crc32(res.data) !== crc) throw new Error("gunzip: CRC mismatch");
+        return res.data;
+    }
+
+    return { crc32: crc32, gzipCompressStored: gzipCompressStored, inflateRaw: inflateRaw, gunzip: gunzip };
+})();
+
+    // =========================================================================
+    // 四（续）、JCE 协议模块 (createJCEProtocol) —— 二进制 JCE/QMF 直播窗
+    // 由 JSTV 版 ysp-live-spider.js 的 createJCEProtocol 移植，仅替换 Node 专属调用
+    // （Buffer/zlib/httpBinary/store），W/R 编解码与 wrap/unwrap 与原版逐字相同。
+    // =========================================================================
+
+function createJCEProtocol(h) {
+    let guid,
+        flow = Promise.resolve(),
+        lastRequestAt = -Infinity;
+    function be(value, n) {
+        const out = [];
+        for (let i = n - 1; i >= 0; i--) out.push(Math.floor(value / Math.pow(256, i)) & 255);
+        return out;
+    }
+    function W() {
+        this.b = [];
+    }
+    W.prototype.head = function (type, tag) {
+        this.b.push(tag < 15 ? (tag << 4) | type : 240 | type);
+        if (tag >= 15) this.b.push(tag);
+    };
+    W.prototype.number = function (v, tag) {
+        if (!Number.isSafeInteger(v)) throw new Error("JCE integer outside safe range");
+        if (v === 0) {
+            this.head(12, tag);
+            return;
+        }
+        const n =
+            v >= -128 && v <= 127 ? 1 : v >= -32768 && v <= 32767 ? 2 : v >= -2147483648 && v <= 2147483647 ? 4 : 8;
+        this.head({ 1: 0, 2: 1, 4: 2, 8: 3 }[n], tag);
+        this.b.push(...be(v, n));
+    };
+    function utf8(s) {
+        const text = unescape(encodeURIComponent(s));
+        return Array.from(text, (c) => c.charCodeAt(0));
+    }
+    function text(b) {
+        return decodeURIComponent(escape(String.fromCharCode(...b)));
+    }
+    W.prototype.string = function (value, tag) {
+        const b = utf8(value);
+        this.head(b.length > 255 ? 7 : 6, tag);
+        this.b.push(...be(b.length, b.length > 255 ? 4 : 1), ...b);
+    };
+    W.prototype.bytes = function (b, tag) {
+        this.head(13, tag);
+        this.head(0, 0);
+        this.number(b.length, 0);
+        this.b.push(...b);
+    };
+    W.prototype.struct = function (fn, tag) {
+        this.head(10, tag);
+        fn(this);
+        this.head(11, 0);
+    };
+    function R(bytes) {
+        this.b = bytes;
+        this.p = 0;
+    }
+    R.prototype.get = function (n) {
+        if (!Number.isInteger(n) || n < 0 || n > 2097152 || this.p + n > this.b.length)
+            throw new Error("Truncated JCE");
+        const out = this.b.slice(this.p, this.p + n);
+        this.p += n;
+        return out;
+    };
+    R.prototype.num = function (n, signed) {
+        const a = this.get(n);
+        let v = signed && a[0] & 128 ? -1 : 0;
+        for (const c of a) v = v * 256 + c;
+        if (!Number.isSafeInteger(v)) throw new Error("JCE integer outside safe range");
+        return v;
+    };
+    R.prototype.head = function () {
+        const b = this.num(1, false);
+        return [b & 15, b >> 4 === 15 ? this.num(1, false) : b >> 4];
+    };
+    R.prototype.field = function (depth) {
+        const [t] = this.head();
+        return this.value(t, depth + 1);
+    };
+    R.prototype.value = function (t, depth) {
+        if (depth > 32) throw new Error("JCE nesting limit");
+        if (t <= 3) return this.num([1, 2, 4, 8][t], true);
+        if (t === 4 || t === 5) {
+            const b = this.get(t === 4 ? 4 : 8);
+            const dv = new DataView(new Uint8Array(b).buffer);
+            return t === 4 ? dv.getFloat32(0) : dv.getFloat64(0);
+        }
+        if (t === 6 || t === 7) {
+            const b = this.get(this.num(t === 6 ? 1 : 4, false));
+            if (b.length > 65536) throw new Error("JCE string limit");
+            return text(b);
+        }
+        if (t === 8 || t === 9) {
+            const n = this.field(depth);
+            if (!Number.isInteger(n) || n < 0 || n > 4096) throw new Error("JCE collection limit");
+            const out = t === 9 ? [] : {};
+            for (let i = 0; i < n; i++) {
+                if (t === 9) out.push(this.field(depth));
+                else {
+                    const k = this.field(depth);
+                    out[k] = this.field(depth);
+                }
+            }
+            return out;
+        }
+        if (t === 10) return this.struct(depth + 1);
+        if (t === 12) return 0;
+        if (t === 13) {
+            const [sub] = this.head();
+            if (sub !== 0) throw new Error("Invalid JCE byte array");
+            return this.get(this.field(depth));
+        }
+        throw new Error("Unsupported JCE type " + t);
+    };
+    R.prototype.struct = function (depth = 0) {
+        if (depth > 32) throw new Error("JCE nesting limit");
+        const out = {};
+        while (this.p < this.b.length) {
+            const [t, tag] = this.head();
+            if (t === 11) return out;
+            out[tag] = this.value(t, depth + 1);
+        }
+        return out;
+    };
+    function qua(w, id) {
+        w.string("3.2.7.26212", 0);
+        w.string("302070", 1);
+        [1080, 2400, 3].forEach((v, i) => w.number(v, i + 2));
+        w.string("12", 5);
+        w.number(1, 6);
+        w.number(1, 7);
+        w.number(420, 8);
+        w.string("10070", 9);
+        for (let i = 10; i < 15; i++) w.string("", i);
+        w.struct((s) => {
+            s.number(0, 0);
+            s.number(0, 1);
+            s.string("", 2);
+        }, 15);
+        for (let i = 16; i < 19; i++) w.string("", i);
+        w.struct((s) => {
+            s.number(0, 0);
+            s.head(4, 1);
+            s.b.push(0, 0, 0, 0);
+            s.head(4, 2);
+            s.b.push(0, 0, 0, 0);
+            s.head(5, 3);
+            s.b.push(0, 0, 0, 0, 0, 0, 0, 0);
+        }, 19);
+        w.string(id.slice(0, 16), 20);
+        w.string("Pixel 6", 21);
+        w.number(1, 22);
+        for (let i = 23; i < 27; i++) w.number(0, i);
+        w.string("", 27);
+        w.string("", 28);
+        w.string(id, 29);
+    }
+    function toBase64(bytes) {
+        return bytesToBase64(bytes);
+    }
+    function fromBase64(value) {
+        return Array.from(base64ToBytes(value));
+    }
+    function wrap(body, id, reqid) {
+        const w = new W();
+        w.struct((s) => {
+            s.number(reqid, 0);
+            s.number(25312, 1);
+            s.struct((v) => qua(v, id), 2);
+            s.string("1200013", 3);
+            s.string(id, 4);
+            s.head(9, 5);
+            s.number(0, 0);
+            s.struct(() => { }, 6);
+            s.head(9, 7);
+            s.number(0, 0);
+            [8, 9, 10].forEach((t) => s.number(0, t));
+        }, 0);
+        w.bytes(body, 1);
+        const inner = [38, ...be(w.b.length + 17, 4), 1, ...Array(10).fill(0), ...w.b, 40];
+        const compressed = GzipPure.gzipCompressStored(inner);
+        // prettier-ignore
+        const out = [
+            19, 0, 0, 0, 0, ...be(2, 2), ...be(65281, 2), ...be(25312, 2), 0, 0, ...be(reqid, 8), ...be(531, 4),
+            ...be(10012, 4), ...Array(8).fill(0), ...utf8(id), 1, ...be(302070, 4), ...Array(6).fill(0), 0, 0,
+            0, 0, 0, ...be(inner.length, 4), ...compressed, 3,
+        ];
+        out.splice(1, 4, ...be(out.length, 4));
+        return out;
+    }
+    function unwrap(bytes) {
+        if (bytes.length < 90 || bytes[0] !== 19 || bytes[bytes.length - 1] !== 3)
+            throw new Error("Invalid QMF response");
+        const length = new R(bytes.slice(1, 5)).num(4, false);
+        if (length !== bytes.length) throw new Error("QMF length mismatch");
+        const flags = new R(bytes.slice(21, 25)).num(4, false);
+        let payload = bytes.slice(89, -1);
+        if (flags & 2) payload = GzipPure.gunzip(payload);
+        if (payload[0] !== 38 || payload[payload.length - 1] !== 40) throw new Error("Invalid QMF inner payload");
+        const root = new R(payload.slice(16, -1)).struct();
+        if (!Array.isArray(root[1])) throw new Error("Missing JCE body");
+        return new R(root[1]).struct();
+    }
+    // $fetch 返回的二进制回包格式不确定：可能是 Uint8Array / ArrayBuffer /
+    // base64 字符串 / latin-1 字符串。按 QMF 魔数（首字节 19、末字节 3）逐个试。
+    function responseBytes(data) {
+        if (!data && data !== "") throw new Error("JCE empty response");
+        if (data instanceof Uint8Array) return Array.from(data);
+        if (typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer)
+            return Array.from(new Uint8Array(data));
+        if (typeof data === "string") {
+            try {
+                const asB64 = Array.from(base64ToBytes(data));
+                if (asB64.length >= 90 && asB64[0] === 19 && asB64[asB64.length - 1] === 3) return asB64;
+            } catch (_) {}
+            const out = [];
+            for (let i = 0; i < data.length; i++) out.push(data.charCodeAt(i) & 255);
+            return out;
+        }
+        if (Array.isArray(data)) return data.slice();
+        throw new Error("JCE unsupported response type");
+    }
+    async function request(channel, start, end) {
+        const w = new W();
+        w.string(channel.livePID, 0);
+        w.string(channel.channelID, 1);
+        w.number(start, 2);
+        w.number(end, 3);
+        w.string(channel.definition || "fhd", 4);
+        const packet = wrap(w.b, guid, Date.now() & 2147483647);
+        const response = await h.http.requestBinary({
+            url: "https://jacc.ysp.cctv.cn",
+            method: "POST",
+            headers: { "Content-Type": "application/octet-stream" },
+            body: new Uint8Array(packet),
+        });
+        if (!response.ok || response.status < 200 || response.status >= 300)
+            throw new Error("JCE HTTP " + response.status);
+        const value = unwrap(responseBytes(response.data));
+        if (value[0] !== undefined && value[0] !== 0) throw new Error("JCE business code " + value[0]);
+        const url = value[2];
+        if (typeof url !== "string" || !/^https?:\/\//.test(url)) throw new Error("JCE returned no manifest");
+        if (/^https?:\/\/liverecord\.video\.cloud\.cctv\.com(?:[/:]|$)/i.test(url))
+            throw new Error("JCE returned an unavailable CDN host");
+        return {
+            url,
+            candidates: [url],
+            headers: { "User-Agent": "Mozilla/5.0" },
+            source: "JCE",
+            quality: channel.definition || "fhd",
+            expiresAt: Date.now() / 1000 + 60,
+            resolutionVerified: false,
+        };
+    }
+    function resolve(channel, start, end) {
+        const task = flow.then(async () => {
+            const wait = 700 + Math.floor(Math.random() * 100) - (Date.now() - lastRequestAt);
+            if (wait > 0) await sleep(wait);
+            try {
+                return await request(channel, start, end);
+            } finally {
+                lastRequestAt = Date.now();
+            }
+        });
+        flow = task.then(
+            () => undefined,
+            () => undefined,
+        );
+        return task;
+    }
+    return {
+        start: () => {
+            guid = h.storage.get("jce-guid");
+            if (typeof guid !== "string" || !/^[0-9a-f]{32}$/.test(guid)) {
+                guid = h.randomHex(16);
+                h.storage.set("jce-guid", guid);
+            }
+        },
+        resolve,
+        testing: { W, R, wrap, unwrap, toBase64, fromBase64 },
+    };
+}
+
     function createChannelTable() {
         const CHANNELS = [
             {
@@ -2542,6 +3084,11 @@ var YSPCore = (function () {
     const channels = createChannelTable();
     const bk = createBKProtocol(hostAdapter);
     const device = createDeviceProtocol(hostAdapter);
+    const jce = createJCEProtocol(hostAdapter);
+    jce.start();
+    // 支持 JCE 直播窗（7 天回看）的 53 个台，与 JSTV 版一致
+    const CATCHUP_IDS = new Set(["ahws","bjws","cctv1","cctv10","cctv13","cctv2","cctv3","cctv4","cctv5","cctv5p","cctv6","cctv7","cctv8","cctv8k","cctv9","cetv1","cgtn","cgtnar","cgtndoc","cgtnes","cgtnfr","cgtnru","cqws","dfws","dnws","gdws","gsws","guoxue","gxws","gzws","hainanws","hbws","hebws","henanws","hljws","hnws","jlws","jsws","jxws","lnws","nmgws","nxws","qhws","saxws","scws","sdws","shanxiws","szws","tjws","xizangws","xjws","ynws","zjws"]);
+    const jceCooldown = new Map();
     const resolveCache = new Map();
 
     function getUserConfig() {
@@ -2551,6 +3098,25 @@ var YSPCore = (function () {
             }
         } catch (_) {}
         return {};
+    }
+
+    // JCE 直播窗：与 JSTV 版 resolveJCELive 相同（start = now-120，end = now+900）
+    async function resolveJCELive(channel) {
+        const now = Math.floor(Date.now() / 1000),
+            end = now + 900;
+        const result = await jce.resolve(channel, now - 120, end);
+        return Object.assign({}, result, { expiresAt: end - 60 });
+    }
+
+    // JCE 地址实测不可用时退回 BK（与 Device/BK 的校验逻辑一致）
+    async function resolveJCEValidated(channel) {
+        const r = await resolveJCELive(channel);
+        const verdict = await validatePlayUrl(r.url, r.headers);
+        if (verdict === "bad") {
+            safeLog("JCE 地址实测不可用，回退 BK (" + channel.id + ")");
+            return await pickWorkingBK(channel);
+        }
+        return r;
     }
 
     async function resolveBKOrThrow(channel) {
@@ -2665,6 +3231,15 @@ var YSPCore = (function () {
         let result;
         if (source === "bk") {
             result = await pickWorkingBK(channel);
+        } else if (source === "jce") {
+            if (!CATCHUP_IDS.has(channel.id)) throw new Error("JCE is unavailable for this channel");
+            try {
+                result = await resolveJCEValidated(channel);
+            } catch (e) {
+                safeLog("JCE 路线请求失败，自动回退 BK: " + (e.message || e));
+                jceCooldown.set(channel.id, Date.now() + 300000);
+                result = await pickWorkingBK(channel);
+            }
         } else if (source === "device") {
             try {
                 result = await resolveDeviceValidated(channel, rate);
@@ -2682,12 +3257,21 @@ var YSPCore = (function () {
                     safeLog("Auto 模式 Device 回退 BK (" + channel.id + "): " + (e.message || e));
                     result = await pickWorkingBK(channel);
                 }
+            } else if (CATCHUP_IDS.has(channel.id) && (jceCooldown.get(channel.id) || 0) <= Date.now()) {
+                // auto：无 Device 的回看台先试 JCE，失败冷却 5 分钟并退回 BK（与 JSTV 版一致）
+                try {
+                    result = await resolveJCEValidated(channel);
+                } catch (e) {
+                    jceCooldown.set(channel.id, Date.now() + 300000);
+                    safeLog("Auto 模式 JCE 回退 BK (" + channel.id + "): " + (e.message || e));
+                    result = await pickWorkingBK(channel);
+                }
             } else {
                 result = await pickWorkingBK(channel);
             }
         }
 
-        const ttlMs = result.source === "device" ? 50000 : 180000;
+        const ttlMs = result.source === "device" ? 50000 : result.source === "JCE" ? 840000 : 180000;
         resolveCache.set(cacheKey, {
             data: result,
             expiresAt: Date.now() + ttlMs,
@@ -2717,6 +3301,8 @@ var YSPCore = (function () {
         channels: channels,
         bk: bk,
         device: device,
+        jce: jce,
+        catchupIDs: CATCHUP_IDS,
         host: hostAdapter,
         resolvePlayable: resolvePlayable,
         channelToCard: channelToCard,
@@ -2733,7 +3319,7 @@ var YSPCore = (function () {
 
 var appConfig = {
     ver: 2,
-    version: "2.1.1",
+    version: "2.2.0",
     name: "央视频直播",
     title: "央视频直播",
     desc: "央视频电视直播 (Device投屏超清 + BK主备源 v2)",
@@ -2823,6 +3409,22 @@ async function getTracks(ext) {
                         id: channel.id,
                         source: "device",
                         rate: "",
+                    },
+                },
+            ],
+        });
+    }
+
+    if (YSPCore.catchupIDs.has(channel.id)) {
+        groups.push({
+            title: "JCE 直播源",
+            tracks: [
+                {
+                    name: channel.name + " [JCE]",
+                    pan: "",
+                    ext: {
+                        id: channel.id,
+                        source: "jce",
                     },
                 },
             ],
