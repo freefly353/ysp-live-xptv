@@ -1,6 +1,6 @@
 /*
  * ===================================================================
- *  央视频直播 (YSP Live v9.5) —— XPTV 内置 JS 扩展版 v2.2.0
+ *  央视频直播 (YSP Live v9.5) —— XPTV 内置 JS 扩展版 v2.2.1
  * ===================================================================
  *
  *  v2.1.0 是在 v2.0.0 基础上加的自动换源（见下）；v2 是对 v1.0.0 的修正重发，不是重写：Device / BK / 频道表与
@@ -41,6 +41,10 @@
  *     失败冷却 5 分钟并退回 BK；也可手动选 [JCE] 线路。注意：JCE 请求体是
  *     二进制（Uint8Array），回包格式也依赖宿主 $fetch 的处理，真机验证前
  *     不能保证 $fetch 一定按二进制透传——若 JCE 在真机上失败，会自动退回 BK。
+ *  7. v2.2.1：修 v2.2.0 引入的挂起——卫视全部一直转圈，是因为 JCE 的二进制
+ *     POST 让宿主 $fetch 一直不回包，阻塞了 BK 回退。现给 JCE 请求加 6 秒超时，
+ *     超时或失败时改用 latin-1 字符串体重试一次；都没有定时器的宿主只用
+ *     字符串体（快速失败，不挂起）。JCE 再也不会无限挂起，失败即退回 BK。
  *
  *  路由（与 v1.0.0 相同）：
  *  - auto：有 Device ID 且不在 forceBK 的台优先 Device，失败回退 BK；
@@ -649,6 +653,29 @@ var YSPCore = (function () {
         const deadline = Date.now() + Math.min(ms, 800);
         while (Date.now() < deadline) {}
         return Promise.resolve();
+    }
+
+    // 给一个 Promise 加超时（宿主提供 setTimeout 时才有效；没有定时器时原样返回）。
+    // 用于 JCE 的二进制 POST：宿主 $fetch 若处理不了 Uint8Array 可能一直不回包，
+    // 超时能把它变成一次失败并触发 BK 回退，而不是让播放器一直转圈。
+    function withTimeout(promise, ms, message) {
+        if (typeof setTimeout !== "function" || typeof clearTimeout !== "function") return promise;
+        let timer = null;
+        const timeout = new Promise(function (_, reject) {
+            timer = setTimeout(function () {
+                reject(new Error(message || "timeout"));
+            }, ms);
+        });
+        return Promise.race([promise, timeout]).then(
+            function (v) {
+                if (timer) clearTimeout(timer);
+                return v;
+            },
+            function (e) {
+                if (timer) clearTimeout(timer);
+                throw e;
+            }
+        );
     }
 
     function safeLog(message) {
@@ -2205,6 +2232,15 @@ function createJCEProtocol(h) {
         if (!Array.isArray(root[1])) throw new Error("Missing JCE body");
         return new R(root[1]).struct();
     }
+    // 字节数组 -> latin-1 字符串（每字节一个字符）。JCE 请求体的备用格式：
+    // 宿主 $fetch 一定能处理字符串体；若它按 latin-1 发送则字节无损，
+    // 若按 UTF-8 发送则高位字节会损坏、服务端会报错——都是快速失败，不会挂起。
+    function bytesToLatin1(bytes) {
+        let out = "";
+        for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+        return out;
+    }
+
     // $fetch 返回的二进制回包格式不确定：可能是 Uint8Array / ArrayBuffer /
     // base64 字符串 / latin-1 字符串。按 QMF 魔数（首字节 19、末字节 3）逐个试。
     function responseBytes(data) {
@@ -2232,12 +2268,34 @@ function createJCEProtocol(h) {
         w.number(end, 3);
         w.string(channel.definition || "fhd", 4);
         const packet = wrap(w.b, guid, Date.now() & 2147483647);
-        const response = await h.http.requestBinary({
-            url: "https://jacc.ysp.cctv.cn",
-            method: "POST",
-            headers: { "Content-Type": "application/octet-stream" },
-            body: new Uint8Array(packet),
-        });
+        // 二进制 POST：先试 Uint8Array（标准二进制体）；若宿主 $fetch 处理不了
+        // （一直不回包或抛错），再试 latin-1 字符串体。两次都加 6 秒超时，
+        // 避免 $fetch 挂起导致播放器一直转圈；都失败则抛错，由上层退回 BK。
+        // 若宿主没有 setTimeout（无法超时），只用字符串体——它一定快速失败，
+        // 不会挂起。
+        const hasTimer = typeof setTimeout === "function" && typeof clearTimeout === "function";
+        const bodies = hasTimer ? [new Uint8Array(packet), bytesToLatin1(packet)] : [bytesToLatin1(packet)];
+        let response = null;
+        let lastError = null;
+        for (let i = 0; i < bodies.length; i++) {
+            try {
+                response = await withTimeout(
+                    h.http.requestBinary({
+                        url: "https://jacc.ysp.cctv.cn",
+                        method: "POST",
+                        headers: { "Content-Type": "application/octet-stream" },
+                        body: bodies[i],
+                    }),
+                    6000,
+                    "JCE request timeout"
+                );
+                break;
+            } catch (e) {
+                lastError = e;
+                h.log("JCE 请求体格式 " + (i === 0 && hasTimer ? "Uint8Array" : "latin-1") + " 失败: " + (e.message || e));
+            }
+        }
+        if (!response) throw lastError || new Error("JCE request failed");
         if (!response.ok || response.status < 200 || response.status >= 300)
             throw new Error("JCE HTTP " + response.status);
         const value = unwrap(responseBytes(response.data));
@@ -3319,7 +3377,7 @@ function createJCEProtocol(h) {
 
 var appConfig = {
     ver: 2,
-    version: "2.2.0",
+    version: "2.2.1",
     name: "央视频直播",
     title: "央视频直播",
     desc: "央视频电视直播 (Device投屏超清 + BK主备源 v2)",

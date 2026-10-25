@@ -1,10 +1,10 @@
-# YSP Live for XPTV — 央视频直播 v2.2.0
+# YSP Live for XPTV — 央视频直播 v2.2.1
 
 央视频（Yangshipin）直播，XPTV / TVBox `csp` 格式的 JS 扩展。64 个频道（央视 30 + 卫视 34），点播时现算签名地址播放。
 
 ## 文件
 
-- `ysp-live-xptv.js` — 扩展本体（2,907 行）。以用户提供的 Ysp_Xptv_1.0.0.txt 为底，在 v2.0.0 修正版上加了 v2.1.0 的自动换源、v2.1.1 的重新解析与 v2.2.0 的 JCE。
+- `ysp-live-xptv.js` — 扩展本体（2,907 行）。以用户提供的 Ysp_Xptv_1.0.0.txt 为底，在 v2.0.0 修正版上加了 v2.1.0 的自动换源、v2.1.1 的重新解析、v2.2.0 的 JCE 与 v2.2.1 的防挂起。
 - `subscription.json` — 单站点订阅（type 3 / api `csp_ysp` / ext 为本文件 raw 链接），可直接当 XPTV 订阅地址。
 
 ## 怎么用
@@ -37,6 +37,8 @@ https://raw.githubusercontent.com/freefly353/ysp-live-xptv/main/subscription.jso
 v2.1.1 补充：BK 候选地址全部不可用时，重新向上游要一份新地址（新签名）再试一次。JSTV 里清后台重开能修好，是因为它清掉了内存里的旧状态；XPTV 里清后台重开修不好，说明坏的是上游当时给的地址，不是本地状态——所以改为重新解析一次，而不是只换备线。
 
 v2.2.0 补充：JCE 已搬进来，卫视与 JSTV 的根本区别（JSTV 卫视先走 JCE、再退 BK）已补齐。仍没有 7 天回看（只做了直播窗，XPTV 的播放接口没有回看时间参数）。注意：JCE 请求体是二进制（Uint8Array），回包格式也依赖宿主 `$fetch` 的处理——本机用模拟上游验证通过，但真机上 `$fetch` 是否按二进制透传请求体与回包尚未验证；若 JCE 在真机上失败，会自动退回 BK（央视 Device、卫视 BK 不受影响）。
+
+v2.2.1 补充：修 v2.2.0 引入的挂起——卫视全部一直转圈，是因为 JCE 的二进制 POST 让宿主 `$fetch` 一直不回包，阻塞了 BK 回退。现给 JCE 请求加 6 秒超时，超时或失败时改用 latin-1 字符串体重试一次；都没有定时器的宿主只用字符串体（快速失败，不挂起）。JCE 再也不会无限挂起，失败即退回 BK。
 
 ## 验证状态
 
