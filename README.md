@@ -15,6 +15,12 @@
  "ext": "https://raw.githubusercontent.com/freefly353/ysp-live-xptv/main/ysp-live-xptv.js"}
 ```
 
+也可以直接把本仓库的 `subscription.json` 当订阅地址加进 XPTV：
+
+```
+https://raw.githubusercontent.com/freefly353/ysp-live-xptv/main/subscription.json
+```
+
 `ext` 也可以换成你自己的托管地址。XPTV 加载后调用文件的五个全局函数：`getConfig` / `getCards` / `getTracks` / `getPlayinfo` / `search`。
 
 ## 能播什么、不能播什么
