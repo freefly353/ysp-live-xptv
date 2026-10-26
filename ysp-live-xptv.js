@@ -1,6 +1,6 @@
 /*
  * ===================================================================
- *  央视频直播 (YSP Live v9.5) —— XPTV 内置 JS 扩展版 v2.2.2
+ *  央视频直播 (YSP Live v9.5) —— XPTV 内置 JS 扩展版 v2.2.3
  * ===================================================================
  *
  *  v2.1.0 是在 v2.0.0 基础上加的自动换源（见下）；v2 是对 v1.0.0 的修正重发，不是重写：Device / BK / 频道表与
@@ -49,6 +49,11 @@
  *     （v2.2.2），用来确认 XPTV 实际加载的是哪个版本（缓存旧版是常见原因）；
  *     ② 给所有 $fetch 请求（BK/Device 上游）也加 10 秒超时，防止上游不回包
  *     时整个解析挂起。确认版本后会去掉备注里的版本号。
+ *  9. v2.2.3：清理版——已确认加载的是 v2.2.2，去掉频道备注里的临时版本号，
+ *     其余逻辑与 v2.2.2 完全一致（BK/Device/JCE、超时、频道表均未动）。
+ *  10. v2.2.3 诊断版：临时加编码诊断——点播后把那路流的 m3u8 的 CODECS
+ *     和第一条分片的后缀（.ts 还是 .m4s）记下来，回频道列表时显示在备注里，
+ *     用来确认 BK 与 Device 的编码格式是否一样。确认后应删掉这段诊断代码。
  *
  *  路由（与 v1.0.0 相同）：
  *  - auto：有 Device ID 且不在 forceBK 的台优先 Device，失败回退 BK；
@@ -696,7 +701,12 @@ var YSPCore = (function () {
             if (typeof $cache === "undefined" || typeof $cache.get !== "function") return null;
             const raw = $cache.get("ysp_live_" + key);
             if (raw === undefined || raw === null || raw === "") return null;
-            return typeof raw === "string" ? JSON.parse(raw) : raw;
+            if (typeof raw !== "string") return raw;
+            try {
+                return JSON.parse(raw);
+            } catch (_) {
+                return raw; // plain string (e.g. diagnostic text, JCE guid), not JSON
+            }
         } catch (_) {
             return null;
         }
@@ -3355,11 +3365,16 @@ function createJCEProtocol(h) {
 
     function channelToCard(c) {
         const hasDevice = !!device.liveIDs[c.id] && !channels.forceBK.has(c.id);
+        let remarks = hasDevice ? c.quality + " · 投屏源" : c.quality;
+        try {
+            const diag = hostAdapter.storage.get("diag:" + c.id);
+            if (typeof diag === "string" && diag) remarks += " · " + diag;
+        } catch (e) {}
         return {
             vod_id: c.id,
             vod_name: c.name,
             vod_pic: c.logo || "",
-            vod_remarks: (hasDevice ? c.quality + " · 投屏源" : c.quality) + " · v2.2.2",
+            vod_remarks: remarks,
             ext: {
                 id: c.id,
                 name: c.name,
@@ -3389,7 +3404,7 @@ function createJCEProtocol(h) {
 
 var appConfig = {
     ver: 2,
-    version: "2.2.2",
+    version: "2.2.3",
     name: "央视频直播",
     title: "央视频直播",
     desc: "央视频电视直播 (Device投屏超清 + BK主备源 v2)",
@@ -3537,6 +3552,53 @@ async function getTracks(ext) {
     return jsonify({ list: groups });
 }
 
+// 临时诊断（v2.2.3）：把解析出的那路流的真实编码信息记下来。
+    // 拉一次 m3u8，取 CODECS（主播放列表才有）和第一条非 # 行的后缀
+    // （分片 .ts 还是变体 .m3u8），存进 $cache，下次回频道列表时显示在备注里。
+    // 不阻塞播放（getPlayinfo 里 fire-and-forget），任何失败都只记一条简短说明。
+    async function recordStreamDiag(source, channelId, url, headers) {
+        const key = "diag:" + channelId;
+        const label = source === "BK live" ? "BK" : source === "device" ? "Device" : source === "JCE" ? "JCE" : String(source || "?");
+        try {
+            const res = await YSPCore.host.http.request({
+                url: url,
+                method: "GET",
+                headers: headers || {},
+                timeoutSeconds: 10,
+            });
+            const text = res && typeof res.body === "string" ? res.body.replace(/^\uFEFF/, "") : "";
+            if (!text || text.indexOf("#EXTM3U") < 0) {
+                YSPCore.host.storage.set(key, label + ": m3u8 invalid");
+                return;
+            }
+            const codecsMatch = /CODECS="([^"]*)"/i.exec(text);
+            const codecs = codecsMatch ? codecsMatch[1] : "";
+            let firstUrl = "";
+            const lines = text.split(/\r?\n/);
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (line && line.charAt(0) !== "#") {
+                    firstUrl = line;
+                    break;
+                }
+            }
+            let firstExt = "";
+            if (firstUrl) {
+                const clean = firstUrl.split("?")[0].split("#")[0];
+                const dot = clean.lastIndexOf(".");
+                firstExt = dot >= 0 ? clean.slice(dot) : "";
+            }
+            let diag = label;
+            if (codecs) diag += " " + codecs;
+            if (firstExt) diag += " " + firstExt;
+            YSPCore.host.storage.set(key, diag);
+        } catch (e) {
+            try {
+                YSPCore.host.storage.set(key, label + ": diag fail");
+            } catch (_) {}
+        }
+    }
+
 async function getPlayinfo(ext) {
     ext = argsify(ext);
     let result;
@@ -3562,6 +3624,11 @@ async function getPlayinfo(ext) {
     }
 
     const playHeaders = result.headers || {};
+    // 诊断：把这路流的编码信息记下来（不阻塞播放，失败也不影响返回）。
+    try {
+        const diagPromise = recordStreamDiag(result.source, ext.id, orderedUrls[0], playHeaders);
+        if (diagPromise && typeof diagPromise.catch === "function") diagPromise.catch(function () {});
+    } catch (e) {}
     return jsonify({
         urls: orderedUrls,
         url: orderedUrls[0],
