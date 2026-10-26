@@ -1,6 +1,6 @@
 /*
  * ===================================================================
- *  央视频直播 (YSP Live v9.5) —— XPTV 内置 JS 扩展版 v2.2.3
+ *  央视频直播 (YSP Live v9.5) —— XPTV 内置 JS 扩展版 v2.2.4
  * ===================================================================
  *
  *  v2.1.0 是在 v2.0.0 基础上加的自动换源（见下）；v2 是对 v1.0.0 的修正重发，不是重写：Device / BK / 频道表与
@@ -54,6 +54,10 @@
  *  10. v2.2.3 诊断版：临时加编码诊断——点播后把那路流的 m3u8 的 CODECS
  *     和第一条分片的后缀（.ts 还是 .m4s）记下来，回频道列表时显示在备注里，
  *     用来确认 BK 与 Device 的编码格式是否一样。确认后应删掉这段诊断代码。
+ *  11. v2.2.4：修诊断拿不到结果——原来诊断是 fire-and-forget，真机上
+ *     getPlayinfo 返回后宿主不再跑挂起的异步任务，所以备注里什么都没有。
+ *     现改成在 getPlayinfo 里 await 诊断跑完再返回（诊断自带 10 秒超时），
+ *     并把临时版本号 v2.2.4 加回备注里，方便确认加载的是哪个版本。
  *
  *  路由（与 v1.0.0 相同）：
  *  - auto：有 Device ID 且不在 forceBK 的台优先 Device，失败回退 BK；
@@ -3365,7 +3369,7 @@ function createJCEProtocol(h) {
 
     function channelToCard(c) {
         const hasDevice = !!device.liveIDs[c.id] && !channels.forceBK.has(c.id);
-        let remarks = hasDevice ? c.quality + " · 投屏源" : c.quality;
+        let remarks = (hasDevice ? c.quality + " · 投屏源" : c.quality) + " · v2.2.4";
         try {
             const diag = hostAdapter.storage.get("diag:" + c.id);
             if (typeof diag === "string" && diag) remarks += " · " + diag;
@@ -3404,7 +3408,7 @@ function createJCEProtocol(h) {
 
 var appConfig = {
     ver: 2,
-    version: "2.2.3",
+    version: "2.2.4",
     name: "央视频直播",
     title: "央视频直播",
     desc: "央视频电视直播 (Device投屏超清 + BK主备源 v2)",
@@ -3624,10 +3628,11 @@ async function getPlayinfo(ext) {
     }
 
     const playHeaders = result.headers || {};
-    // 诊断：把这路流的编码信息记下来（不阻塞播放，失败也不影响返回）。
+    // 诊断：把这路流的编码信息记下来。必须 await——实测 fire-and-forget 在真机上
+    // 拿不到结果（getPlayinfo 返回后宿主似乎就不再跑挂起的异步任务），所以这里等它
+    // 跑完再返回地址；诊断自带 10 秒超时，失败也不影响返回。
     try {
-        const diagPromise = recordStreamDiag(result.source, ext.id, orderedUrls[0], playHeaders);
-        if (diagPromise && typeof diagPromise.catch === "function") diagPromise.catch(function () {});
+        await recordStreamDiag(result.source, ext.id, orderedUrls[0], playHeaders);
     } catch (e) {}
     return jsonify({
         urls: orderedUrls,
